@@ -1,0 +1,147 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <esp_wifi.h>
+
+// =======================================================
+// CONFIGURATION (SET BEFORE RUNNING)
+// Replace with your WiFi and Firebase credentials
+// =======================================================
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+const char* firebaseURL = "https://YOUR_PROJECT_ID.firebaseio.com/machine_data.json";
+
+// ===== Received Data Buffers =====
+bool newData = false;
+
+float timestamp_ms, tempC;
+String arrX, arrY, arrZ;
+float voltageV, rpm, current_mA;
+
+// ===== Helper: Convert CSV list to JSON array =====
+void addCSVtoArray(String csv, JsonArray arr) {
+  int start = 0;
+  while (true) {
+    int comma = csv.indexOf(',', start);
+    if (comma == -1) {
+      arr.add(csv.substring(start).toFloat());
+      break;
+    }
+    arr.add(csv.substring(start, comma).toFloat());
+    start = comma + 1;
+  }
+}
+
+// ===== ESP-NOW Receive Callback =====
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) 
+{
+  String csv = String((char*)data);
+  Serial.println("\nRAW RECEIVED CSV:");
+  Serial.println(csv);
+
+  int c1 = csv.indexOf(',');
+  int c2 = csv.indexOf(',', c1 + 1);
+
+  timestamp_ms = csv.substring(0, c1).toFloat();
+  tempC = csv.substring(c1 + 1, c2).toFloat();
+
+  int sx = csv.indexOf('[', c2);
+  int ex = csv.indexOf(']', sx);
+  arrX = csv.substring(sx + 1, ex);
+
+  int sy = csv.indexOf('[', ex);
+  int ey = csv.indexOf(']', sy);
+  arrY = csv.substring(sy + 1, ey);
+
+  int sz = csv.indexOf('[', ey);
+  int ez = csv.indexOf(']', sz);
+  arrZ = csv.substring(sz + 1, ez);
+
+  String remaining = csv.substring(ez + 2);
+  sscanf(remaining.c_str(), "%f,%f,%f", &voltageV, &rpm, &current_mA);
+
+  newData = true;
+
+  Serial.println("Data Parsed Successfully");
+}
+
+// ===== Upload to Firebase =====
+void uploadToFirebase() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  StaticJsonDocument<5000> doc;
+
+  doc["timestamp_ms"] = timestamp_ms;
+  doc["tempC"] = tempC;
+
+  JsonArray xArray = doc.createNestedArray("burstX");
+  JsonArray yArray = doc.createNestedArray("burstY");
+  JsonArray zArray = doc.createNestedArray("burstZ");
+
+  addCSVtoArray(arrX, xArray);
+  addCSVtoArray(arrY, yArray);
+  addCSVtoArray(arrZ, zArray);
+
+  doc["voltageV"] = voltageV;
+  doc["RPM"] = rpm;
+  doc["current_mA"] = current_mA;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.println("Uploading to Firebase...");
+
+  http.begin(client, firebaseURL);
+  http.addHeader("Content-Type", "application/json");
+  int httpCode = http.PUT(payload);
+
+  if (httpCode > 0) {
+    Serial.printf("Firebase Updated (HTTP %d)\n", httpCode);
+  } else {
+    Serial.printf("Upload Failed: %s\n", http.errorToString(httpCode).c_str());
+  }
+
+  http.end();
+}
+
+// ===== Setup =====
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected");
+
+  uint8_t primaryChan;
+  wifi_second_chan_t secondChan;
+  esp_wifi_get_channel(&primaryChan, &secondChan);
+  esp_wifi_set_channel(primaryChan, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW Init Failed!");
+    return;
+  }
+
+  esp_now_register_recv_cb(OnDataRecv);
+
+  Serial.println("ESP-NOW Receiver Ready");
+}
+
+// ===== Loop =====
+void loop() {
+  if (newData) {
+    uploadToFirebase();
+    newData = false;
+  }
+}
