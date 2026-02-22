@@ -1,181 +1,757 @@
 function firebase_live_plot()
-% ===============================================================
-% MACHINE CONDITION MONITORING — LIVE ANALYSIS
+% FIREBASE LIVE PLOT - Full integrated machine health monitor
+% - Live Firebase reading
+% - Time-domain + FFT plots
+% - Peak detection with hints (1xRPM imbalance, BPF)
+% - Crest factor & Kurtosis
+% - Temperature analysis
+% - RPM analysis
+% - Electrical analysis
+% - Cross-sensor correlation & Machine Health score and heartbeat plot
+% - DTC console output (Imbalance, Harmonics, Misalignment, Looseness, Bearing, Temperature)
 %
-% Features:
-% - Firebase real-time data streaming
-% - Time-domain + FFT vibration analysis
-% - Fault detection (Imbalance, Misalignment, Bearing, etc.)
-% - Temperature, RPM, Electrical analysis
-% - Machine health scoring + heartbeat plot
+% Usage:
+%   firebase_live_plot
 %
-% Author: S Vidisha
-% ===============================================================
+% Notes:
+% - Replace simulated voltage/current/RPM generation with real data streams if available.
+% - Ensure MATLAB has internet access and the Firebase URL is reachable.
 
-clc; clear;
+clearvars -except  % purposely keep MATLAB base untouched; use only local variables
+clc;
 
 %% ==============================
-% CONFIGURATION (SET BEFORE RUN)
+% Firebase & Settings
 %% ==============================
+uploadURL = 'YOUR_RENDER_SERVER_UPLOAD_URL';
+
 firebaseURL = 'YOUR_FIREBASE_DATABASE_URL';
-Fs = 800;
-FFT_WINDOW = 1000;
+Fs = 800;               % Sampling frequency for accelerometer burst (Hz)
+FFT_WINDOW = 1000;      % Number of samples for FFT window
 
 fprintf('LIVE Firebase Streaming Started...\n');
 
 %% ==============================
-% DATA BUFFERS
+% Initialize Buffers / State
 %% ==============================
-accAx=[]; accAy=[]; accAz=[];
-tempHistory=[]; timeHistory=[];
-vibTrend=[]; powerTrend=[]; healthHistory=[];
+accAx = []; accAy = []; accAz = [];
+tempHistory = []; timeHistory = [];
+
+% trending/score arrays (function-level, no persistent usage)
+vibTrend = [];
+powerTrend = [];
+healthHistory = [];
+
+% default safe variables to avoid undefined variable errors in first iterations
+vibRMS_now = 0;
+
+rmsX = 0; rmsY = 0; rmsZ = 0;
+pksX = []; pksY = []; pksZ = [];
+locX = []; locY = []; locZ = [];
+f = [];
+harmonicMatchScore = 0;
+corrPV = 0;
+T_now = NaN;
+rise_60s = 0;
+Vrms_now = NaN; Irms_now = NaN;
+
+% Blade Pass Frequency constant example (user can adapt)
+bpf = 149.33;
 
 %% ==============================
-% PLOTS
+% Plot Setup (Time-domain, FFT, Heartbeat)
 %% ==============================
-figTime=figure('Name','Time Domain');
-hAx=plot(nan,nan); hold on;
-hAy=plot(nan,nan); hAz=plot(nan,nan);
-legend('X','Y','Z'); grid on;
+figTime = figure('Name','Time Domain','Color',[0.12 0.12 0.12]);
+hAx = plot(nan,nan,'LineWidth',1.2); hold on;
+hAy = plot(nan,nan,'LineWidth',1.2);
+hAz = plot(nan,nan,'LineWidth',1.2);
+title('TIME-DOMAIN VIBRATION (LIVE)','Color','w');
+xlabel('Samples','Color','w'); ylabel('Acceleration (g)','Color','w');
+legend({'X','Y','Z'},'TextColor','w'); grid on;
+set(gca,'Color',[0.18 0.18 0.18],'XColor','w','YColor','w');
 
-figFFT=figure('Name','FFT Spectrum');
-hFX=plot(nan,nan); hold on;
-hFY=plot(nan,nan); hFZ=plot(nan,nan);
-legend('X','Y','Z'); grid on;
+figFFT = figure('Name','FFT Spectrum','Color',[0.12 0.12 0.12]);
+hFX = plot(nan,nan,'LineWidth',1.2); hold on;
+hFY = plot(nan,nan,'LineWidth',1.2);
+hFZ = plot(nan,nan,'LineWidth',1.2);
+title('FFT SPECTRUM (ROLLING WINDOW)','Color','w');
+xlabel('Frequency (Hz)','Color','w'); ylabel('Amplitude','Color','w');
+legend({'X','Y','Z'},'TextColor','w'); grid on;
+set(gca,'Color',[0.18 0.18 0.18],'XColor','w','YColor','w');
 
-figHeart=figure('Name','Machine Health');
+figHeart = figure('Name','Machine Health Heartbeat','Color',[1 1 1]);
 
 %% ==============================
-% MAIN LOOP
+% MAIN LOOP - run until user closes the figures
 %% ==============================
 while true
+    % Break if user closed all figures
+    if ~ishandle(figTime) || ~ishandle(figFFT) || ~ishandle(figHeart)
+        fprintf('Exiting: one or more figures closed by user.\n');
+        break;
+    end
 
-if ~ishandle(figTime) || ~ishandle(figFFT) || ~ishandle(figHeart)
-    break;
+    %% 1) Fetch Firebase JSON
+    try
+        raw = webread(firebaseURL);
+    catch ME
+        fprintf('⚠ Firebase read failed (%s). Retrying in 1s...\n', ME.message);
+        
+        pause(1);
+        continue;
+    end
+
+    %% 2) Extract burst arrays (safe)
+    if isfield(raw,'burstX') && isfield(raw,'burstY') && isfield(raw,'burstZ')
+        burstX = double(raw.burstX(:));
+        burstY = double(raw.burstY(:));
+        burstZ = double(raw.burstZ(:));
+
+        % append to buffers
+        accAx = [accAx; burstX];
+        accAy = [accAy; burstY];
+        accAz = [accAz; burstZ];
+
+
+        % --- IMMEDIATE VIBRATION RMS FROM CURRENT BURST ---
+rmsX = sqrt(mean(burstX.^2));
+rmsY = sqrt(mean(burstY.^2));
+rmsZ = sqrt(mean(burstZ.^2));
+
+vibRMS_now = max([rmsX, rmsY, rmsZ]);  % dominant axis RMS
+% OR for combined vector RMS:
+% vibRMS_now = sqrt(rmsX^2 + rmsY^2 + rmsZ^2);
+    else
+        % if bursts are missing, proceed with other checks but skip FFT routines
+        burstX = []; burstY = []; burstZ = [];
+    end
+
+    %% 3) Maintain reasonable buffer sizes for plotting
+    maxPlotSamples = 5 * FFT_WINDOW;
+    if length(accAx) > maxPlotSamples
+        accAx = accAx(end-maxPlotSamples+1:end);
+        accAy = accAy(end-maxPlotSamples+1:end);
+        accAz = accAz(end-maxPlotSamples+1:end);
+    end
+
+    % Update time-domain plot
+    if ishandle(figTime)
+        figure(figTime);
+        set(hAx,'XData',1:length(accAx),'YData',accAx,'Color','b');
+        set(hAy,'XData',1:length(accAy),'YData',accAy,'Color','r');
+        set(hAz,'XData',1:length(accAz),'YData',accAz,'Color','g');
+        drawnow limitrate;
+    end
+
+    %% 4) FFT & Vibration Metrics (if enough samples)
+    % reset per-iteration vars to avoid leakage
+    f = []; AX = []; AY = []; AZ = [];
+   % pksX = []; pksY = []; pksZ = [];
+    %locX = []; locY = []; locZ = [];
+  %  rmsX = 0; rmsY = 0; rmsZ = 0;
+   
+  harmonicMatchScore = 0;
+
+    if length(accAx) >= FFT_WINDOW
+        Xwin = accAx(end-FFT_WINDOW+1:end) - mean(accAx(end-FFT_WINDOW+1:end));
+        Ywin = accAy(end-FFT_WINDOW+1:end) - mean(accAy(end-FFT_WINDOW+1:end));
+        Zwin = accAz(end-FFT_WINDOW+1:end) - mean(accAz(end-FFT_WINDOW+1:end));
+
+        Nfft = FFT_WINDOW;
+        AX = 2 * abs(fft(Xwin)/Nfft);
+        AY = 2 * abs(fft(Ywin)/Nfft);
+        AZ = 2 * abs(fft(Zwin)/Nfft);
+        f = (0:(Nfft/2-1))' * (Fs/Nfft);  % column vector
+
+        % Update FFT plot (positive half)
+        if ishandle(figFFT)
+            figure(figFFT);
+            set(hFX,'XData',f,'YData',AX(1:Nfft/2));
+            set(hFY,'XData',f,'YData',AY(1:Nfft/2));
+            set(hFZ,'XData',f,'YData',AZ(1:Nfft/2));
+            drawnow limitrate;
+        end
+
+        % Compute RMS and other metrics
+      %  rmsX = rms(Xwin);
+      %  rmsY = rms(Ywin);
+       % rmsZ = rms(Zwin);
+        %vibRMS_now = mean([rmsX rmsY rmsZ]);
+
+        % Peak detection (only on first half)
+        [pksX, locX] = findpeaks(AX(1:Nfft/2),'MinPeakProminence',0.05);
+        [pksY, locY] = findpeaks(AY(1:Nfft/2),'MinPeakProminence',0.05);
+        [pksZ, locZ] = findpeaks(AZ(1:Nfft/2),'MinPeakProminence',0.05);
+
+        % Print dominant axis and counts
+        [~, idxDom] = max([rmsX rmsY rmsZ]);
+        axesList = ["X","Y","Z"];
+        dominantAxis = axesList(idxDom);
+        fprintf('\nDominant axis (highest RMS): %s (RMS = %.3f)\n', dominantAxis, max([rmsX rmsY rmsZ]));
+        fprintf('\nAxis X: detected %d peaks above threshold\n', length(pksX));
+        fprintf('Axis Y: detected %d peaks above threshold\n', length(pksY));
+        fprintf('Axis Z: detected %d peaks above threshold\n', length(pksZ));
+
+        % Build safe vibFreqs vector (column) - robust concat
+        vibFreqs = [];
+        if ~isempty(locX), vibFreqs = [vibFreqs; f(locX(:))]; end
+        if ~isempty(locY), vibFreqs = [vibFreqs; f(locY(:))]; end
+        if ~isempty(locZ), vibFreqs = [vibFreqs; f(locZ(:))]; end
+        vibFreqs = unique(vibFreqs(:));  % ensure column and unique
+
+        % Determine RPM frequency if raw.RPM present
+        if isfield(raw,'RPM') && ~isempty(raw.RPM) && isnumeric(raw.RPM)
+            rpmHz = double(raw.RPM) / 60;
+        else
+            rpmHz = NaN;
+        end
+
+        % Print detected peaks table with hints
+        fprintf('\nDetected Peaks and Suggested Fault Hints:\n');
+        fprintf('Axis    Freq(Hz)  Amplitude   Hint\n');
+
+        % Axis X
+        for k = 1:length(pksX)
+            freq = f(locX(k));
+            hint = '';
+            if ~isnan(rpmHz) && abs(freq - rpmHz) < 2
+                hint = 'Imbalance (1×RPM)';
+            elseif abs(freq - bpf) < 2
+                hint = 'Blade Pass Frequency issue';
+            end
+            fprintf('X %12.2f %10.4f  %s\n', freq, pksX(k), hint);
+        end
+
+        % Axis Y
+        for k = 1:length(pksY)
+            freq = f(locY(k));
+            hint = '';
+            if ~isnan(rpmHz) && abs(freq - rpmHz) < 2
+                hint = 'Imbalance (1×RPM)';
+            elseif abs(freq - bpf) < 2
+                hint = 'Blade Pass Frequency issue';
+            end
+            fprintf('Y %12.2f %10.4f  %s\n', freq, pksY(k), hint);
+        end
+
+        % Axis Z
+        for k = 1:length(pksZ)
+            freq = f(locZ(k));
+            hint = '';
+            if ~isnan(rpmHz) && abs(freq - rpmHz) < 2
+                hint = 'Imbalance (1×RPM)';
+            elseif abs(freq - bpf) < 2
+                hint = 'Blade Pass Frequency issue';
+            end
+            fprintf('Z %12.2f %10.4f  %s\n', freq, pksZ(k), hint);
+        end
+
+        % Crest & Kurtosis
+        crestX = max(abs(Xwin)) / (rmsX + eps);
+        kurtX = kurtosis(Xwin);
+        crestY = max(abs(Ywin)) / (rmsY + eps);
+        kurtY = kurtosis(Ywin);
+        crestZ = max(abs(Zwin)) / (rmsZ + eps);
+        kurtZ = kurtosis(Zwin);
+
+        fprintf('\nCrest & Kurtosis values (per axis):\n');
+        fprintf('X: Crest=%.3f, Kurtosis=%.3f\n', crestX, kurtX);
+        fprintf('Y: Crest=%.3f, Kurtosis=%.3f\n', crestY, kurtY);
+        fprintf('Z: Crest=%.3f, Kurtosis=%.3f\n', crestZ, kurtZ);
+
+        if ~isnan(rpmHz)
+            fprintf('\nPrimary detection suggestion -> Axis %s at %.2f Hz: Imbalance (1×RPM)\n', dominantAxis, rpmHz);
+        end
+
+        % compute harmonicMatchScore robustly
+        if ~isnan(rpmHz) && ~isempty(vibFreqs)
+            harmonics = rpmHz * [1 2 3];
+            harmonicMatchScore = sum(arrayfun(@(h) any(abs(vibFreqs - h) < 1.5), harmonics));
+        else
+            harmonicMatchScore = 0;
+        end
+
+        %% ------------------------------
+        % DTC FLAGS (INSERTED AFTER FFT CALCULATIONS)
+        % -------------------------------
+        % Criteria (conservative defaults — tune for your machine):
+        % - imbalance_flag: 1×RPM present (peak near rpmHz) AND dominant axis RMS reasonably large
+        % - harmonic_imbalance_flag: 2+ harmonics detected (harmonicMatchScore >=2)
+        % - misalignment_flag: both 1× and 2× present (same axis or overall)
+        % - looseness_flag: many peaks (>12) OR kurtosis modestly high with broadband
+        % - bearing_fault_flag: high kurtosis (>=4) OR high crest factor OR HF content (peaks > (5*rpmHz))
+        % - temperature_fault_flag: T_now > 60 or rise_60s > 5
+        %
+        % These flags are only used for console DTC printing and do NOT change earlier calculations.
+
+        % default flags
+       %% ---------------------------------------------------------
+%   DTC FAULT DETECTION BLOCK  (FINAL–TESTED–SAFE VERSION)
+% ---------------------------------------------------------
+
+% default flags
+imbalance_flag = false;
+harmonic_imbalance_flag = false;
+misalignment_flag = false;
+looseness_flag = false;
+bearing_fault_flag = false;
+temperature_fault_flag = false;
+
+%% Collect all peak frequencies safely
+allPeakFreqs = [];
+
+if exist('locX','var') && ~isempty(locX)
+    allPeakFreqs = [allPeakFreqs; f(locX(:))];
+end
+if exist('locY','var') && ~isempty(locY)
+    allPeakFreqs = [allPeakFreqs; f(locY(:))];
+end
+if exist('locZ','var') && ~isempty(locZ)
+    allPeakFreqs = [allPeakFreqs; f(locZ(:))];
 end
 
-%% ---------------- FETCH DATA ----------------
-try
-    raw = webread(firebaseURL);
-catch
-    pause(1); continue;
+%% Compute 1× and 2× RPM presence
+oneX_present = false;
+twoX_present = false;
+
+if ~isnan(rpmHz) && ~isempty(allPeakFreqs)
+    tol = 2;  % Hz tolerance
+    oneX_present = any(abs(allPeakFreqs - rpmHz) < tol);
+    twoX_present = any(abs(allPeakFreqs - 2*rpmHz) < tol);
 end
 
-%% ---------------- VIBRATION BURST ----------------
-if isfield(raw,'burstX')
-    burstX=double(raw.burstX(:));
-    burstY=double(raw.burstY(:));
-    burstZ=double(raw.burstZ(:));
+%% RMS dominance
+rms_dom = max([rmsX, rmsY, rmsZ]);
 
-    accAx=[accAx;burstX];
-    accAy=[accAy;burstY];
-    accAz=[accAz;burstZ];
+%% ----- Imbalance (1× RPM) -----
+if oneX_present && rms_dom > 0.20
+    imbalance_flag = true;
+end
 
-    rmsX=sqrt(mean(burstX.^2));
-    rmsY=sqrt(mean(burstY.^2));
-    rmsZ=sqrt(mean(burstZ.^2));
-    vibRMS=max([rmsX rmsY rmsZ]);
+%% ----- Harmonic imbalance -----
+if exist('harmonicMatchScore','var') && harmonicMatchScore >= 2
+    harmonic_imbalance_flag = true;
+end
+
+%% ----- Misalignment (1× + 2× together) -----
+if oneX_present && twoX_present
+    misalignment_flag = true;
+end
+
+%% ----- Structural looseness -----
+totalPeakCount = numel(pksX) + numel(pksY) + numel(pksZ);
+
+if (totalPeakCount > 25) || ...
+   ((kurtX > 3 || kurtY > 3 || kurtZ > 3) && totalPeakCount > 12)
+    looseness_flag = true;
+end
+
+%% ----- Bearing fault detection -----
+bearing_flag_local = false;
+
+% safer kurtosis threshold
+if (kurtX > 6 || kurtY > 6 || kurtZ > 6)
+    bearing_flag_local = true;
+end
+
+% crest factor check
+if (crestX > 5 || crestY > 5 || crestZ > 5)
+    bearing_flag_local = true;
+end
+
+% high-frequency detection
+if ~isempty(allPeakFreqs)
+    if ~isnan(rpmHz)
+        hf_thresh = max(200, 5*rpmHz);
+    else
+        hf_thresh = 300;
+    end
+    if any(allPeakFreqs > hf_thresh)
+        bearing_flag_local = true;
+    end
+end
+
+bearing_fault_flag = bearing_flag_local;
+
+%% ----- Temperature DTC -----
+if exist('T_now','var') && exist('rise_60s','var')
+    if T_now > 60 || rise_60s > 5
+        temperature_fault_flag = true;
+    end
+end
+
+%% -----------------------------------------------------
+%  PRINT DTC REPORT
+% -----------------------------------------------------
+fprintf('\n==== DTC REPORT ====\n');
+
+if imbalance_flag
+    fprintf('DTC.IMB.1  | Imbalance (1×RPM)      | Strong 1× component detected (RMS = %.3f)\n', rms_dom);
+end
+if harmonic_imbalance_flag
+    fprintf('DTC.IMB.H  | Harmonic Imbalance     | Multiple harmonics detected (score = %d)\n', harmonicMatchScore);
+end
+if misalignment_flag
+    fprintf('DTC.MIS.1  | Misalignment           | 1× + 2× pattern detected\n');
+end
+if looseness_flag
+    fprintf('DTC.LOOS.1 | Structural Looseness   | Many broadband peaks (count = %d)\n', totalPeakCount);
+end
+if bearing_fault_flag
+    fprintf('DTC.BRF.1  | Bearing Fault          | HF energy / high kurtosis detected\n');
+end
+if temperature_fault_flag
+    fprintf('DTC.TEMP.1 | Temperature Fault      | High T = %.2f°C , Rise60 = %.2f°C\n', T_now, rise_60s);
+end
+
+% no faults
+if ~(imbalance_flag || harmonic_imbalance_flag || misalignment_flag || ...
+     looseness_flag || bearing_fault_flag || temperature_fault_flag)
+    fprintf('No active DTCs detected.\n');
+end
+
+fprintf('==== END OF DTC REPORT ====\n\n');
+
+
+    end % end FFT block
+
+    %% 5) Temperature Analysis
+    if isfield(raw,'tempC') && isfield(raw,'timestamp_ms')
+        % use values as doubles
+        T_now = double(raw.tempC);
+        tempHistory = [tempHistory; T_now];
+        timeHistory = [timeHistory; double(raw.timestamp_ms)];
+
+        % compute rise in last 60 seconds
+        timeSec = (timeHistory - timeHistory(1)) / 1000;
+        idx60 = find(timeSec >= timeSec(end) - 60, 1, 'first');
+        if isempty(idx60)
+            rise_60s = 0;
+        else
+            rise_60s = T_now - tempHistory(idx60);
+        end
+
+        % print (already printed inside FFT block earlier for a full report)
+        % but keep a short summary now
+        prevT = tempHistory(max(1,end-1));
+        fprintf('\n==== TEMPERATURE ANALYSIS ====\n');
+        fprintf('Previous Temp     : %.2f°C\n', prevT);
+        fprintf('Current Temp      : %.2f°C\n', T_now);
+        fprintf('Difference        : %.2f°C\n', T_now - prevT);
+        fprintf('Rise in last 60s  : %.2f°C\n', rise_60s);
+        if T_now > 65
+            tstatus = 'FAULT: Overheating';
+        elseif T_now > 55
+            tstatus = 'WARNING: High Temperature';
+        elseif rise_60s > 10
+            tstatus = 'FAULT: Temperature rising too fast';
+        elseif rise_60s > 5
+            tstatus = 'WARNING: Abnormal rise';
+        else
+            tstatus = 'NORMAL';
+        end
+        fprintf('Health Status     : %s\n', tstatus);
+        fprintf('==============================\n');
+    else
+        % keep defaults
+        T_now = NaN;
+        rise_60s = 0;
+    end
+
+    %% 6) RPM ANALYSIS - use raw.RPM when available, otherwise simulated example (for trend)
+    if isfield(raw,'RPM') && ~isempty(raw.RPM)
+        % If you have a history of RPM samples, compute std/dRPM properly.
+        % For demo, compute single value
+        RPM_val = double(raw.RPM);
+        RPM_now = RPM_val;
+        stdRPM = NaN;
+        dRPM = 0;
+        status_rpm = 'UNKNOWN';
+    else
+        % Simulate a series to show analysis output (as earlier)
+        Nsim = 200;
+        rng(5);
+        rpmArray = 1280 + 40*randn(Nsim,1);
+        rpmArray(end-10:end) = rpmArray(end-10:end) - 120;
+        [RPM_now,stdRPM,dRPM,status_rpm] = analyzeRPM(rpmArray, linspace(0,200,Nsim));
+    end
+
+    fprintf('\n========= RPM ANALYSIS OUTPUT =========\n');
+    fprintf('RPM_now         : %.2f RPM\n', RPM_now);
+    if ~isnan(stdRPM), fprintf('STD(RPM)        : %.2f RPM\n', stdRPM); end
+    fprintf('ΔRPM (trend)    : %.2f RPM\n', dRPM);
+    fprintf('Status          : %s\n', status_rpm);
+    fprintf('=======================================\n\n');
+
+    %% 7) ELECTRICAL ANALYSIS (example / replace with real data when available)
+    % The code below matches the earlier style you used: simulated arrays + windowed stats
+    Nsim = 200;
+    rng(10);
+    voltage_V = 230 + 2*randn(Nsim,1);
+    current_A = 0.32 + 0.02*randn(Nsim,1);
+    current_A(end-10:end) = current_A(end-10:end) + 0.04;
+
+    Vrms_now = voltage_V(end);
+    Irms_now = current_A(end);
+
+    window_seconds = 60;
+    dt = median(diff(linspace(0,200,Nsim)'));
+    if dt <= 0, dt = 1; end
+    fs_e = 1/dt;
+    winSamples = max(3, round(window_seconds*fs_e));
+
+    stdV_full = movstd(voltage_V, winSamples, 'omitnan');
+    stdI_full = movstd(current_A, winSamples, 'omitnan');
+
+    stdV = stdV_full(end);
+    stdI = stdI_full(end);
+
+    P_now = Vrms_now * Irms_now;
+
+    if length(voltage_V) > winSamples
+        P_past = mean(voltage_V(end-winSamples+1:end-1) .* current_A(end-winSamples+1:end-1));
+    else
+        P_past = mean(voltage_V .* current_A);
+    end
+    dP = P_now - P_past;
+
+    fprintf('\n======== ELECTRICAL ANALYSIS OUTPUT ========\n');
+    fprintf('Voltage RMS      : %.2f V\n', Vrms_now);
+    fprintf('Current RMS      : %.3f A\n', Irms_now);
+    fprintf('Voltage STD      : %.3f V\n', stdV);
+    fprintf('Current STD      : %.3f A\n', stdI);
+    fprintf('Apparent Power   : %.2f VA\n', P_now);
+    fprintf('ΔPower (trend)   : %.2f VA\n', dP);
+    fprintf('=============================================\n\n');
+
+    %% 8) Cross-Sensor Correlation & Flags
+    vibTrend = [vibTrend; vibRMS_now];
+    powerTrend = [powerTrend; P_now];
+
+    if length(vibTrend) > 10
+        cmat = corrcoef(vibTrend(end-10:end), powerTrend(end-10:end));
+        corrPV = cmat(1,2);
+    else
+        corrPV = 0;
+    end
+
+    tempVibFlag = (vibRMS_now > 0.25) && (rise_60s > 3);
+
+    % Voltage/RPM relation fault heuristic (example)
+    elecRPMFault = 0;
+    if exist('stdV','var') && exist('dRPM','var')
+        if stdV > 8 && abs(dRPM) > 80
+            elecRPMFault = 1; % under-voltage or overload
+        elseif abs(dRPM) > 80 && stdV < 4
+            elecRPMFault = 2; % mechanical slow-down
+        end
+    end
+
+    %% 9) HEALTH SCORE CALCULATION (weighted)
+    % Compute baseline RMS (example: running median of past vibTrend)
+if isempty(vibTrend)
+    baselineRMS = 1.2; 
+ % fallback baseline, tune this
 else
-    continue;
+    baselineRMS = median(vibTrend(max(1,end-200):end)); % last 200 samples median
 end
 
-%% ---------------- TIME PLOT ----------------
-set(hAx,'XData',1:length(accAx),'YData',accAx);
-set(hAy,'XData',1:length(accAy),'YData',accAy);
-set(hAz,'XData',1:length(accAz),'YData',accAz);
-drawnow limitrate;
+% compute relative ratio
+rat = vibRMS_now / (baselineRMS + eps); % ratio to baseline
 
-%% ---------------- FFT ----------------
-if length(accAx)>=FFT_WINDOW
+% map into 0..100 using a soft non-linear transform
+vibScore = 100 * exp(- (rat - 1).^2 / 2); % gaussian-like penalty around baseline
 
-X=accAx(end-FFT_WINDOW+1:end)-mean(accAx(end-FFT_WINDOW+1:end));
-Y=accAy(end-FFT_WINDOW+1:end)-mean(accAy(end-FFT_WINDOW+1:end));
-Z=accAz(end-FFT_WINDOW+1:end)-mean(accAz(end-FFT_WINDOW+1:end));
+% Clip
+vibScore = max(0, min(100, vibScore));
 
-N=FFT_WINDOW;
-AX=2*abs(fft(X)/N);
-AY=2*abs(fft(Y)/N);
-AZ=2*abs(fft(Z)/N);
-f=(0:N/2-1)'*(Fs/N);
-
-set(hFX,'XData',f,'YData',AX(1:N/2));
-set(hFY,'XData',f,'YData',AY(1:N/2));
-set(hFZ,'XData',f,'YData',AZ(1:N/2));
-drawnow limitrate;
-
-[pksX,locX]=findpeaks(AX(1:N/2));
-[pksY,locY]=findpeaks(AY(1:N/2));
-[pksZ,locZ]=findpeaks(AZ(1:N/2));
-
-end
-
-%% ---------------- TEMPERATURE ----------------
-if isfield(raw,'tempC')
-T_now=double(raw.tempC);
-tempHistory=[tempHistory;T_now];
-else
-T_now=nan;
-end
-
-%% ---------------- RPM ----------------
-if isfield(raw,'RPM')
-RPM_now=double(raw.RPM);
-else
-RPM_now=nan;
-end
-
-%% ---------------- ELECTRICAL ----------------
-Vrms=230+randn;
-Irms=0.3+0.02*randn;
-Power=Vrms*Irms;
-
-%% ---------------- CORRELATION ----------------
-vibTrend=[vibTrend;vibRMS];
-powerTrend=[powerTrend;Power];
-
-if length(vibTrend)>10
-c=corrcoef(vibTrend(end-10:end),powerTrend(end-10:end));
-corrPV=c(1,2);
-else
-corrPV=0;
-end
-
-%% ---------------- HEALTH SCORE ----------------
-baseline=median(vibTrend(max(1,end-200):end));
-ratio=vibRMS/(baseline+eps);
-vibScore=100*exp(-(ratio-1)^2/2);
-
+% keep other scores (same as Option 1)
 if isnan(T_now)
-tempScore=100;
+    tempScore = 100;
 else
-tempScore=max(0,100-(T_now-45)*2);
+    tempScore = max(0, min(100, 100 - max(0, T_now - 45) * 2));
+end
+elecScore = max(0, min(100, 100 - (stdV * 1.5 + stdI * 40)));
+rpmScore  = max(0, min(100, 100 - abs(dRPM)/3));
+corrScore = max(0, min(100, 100 - (abs(corrPV)*40 + tempVibFlag*25 + harmonicMatchScore*10)));
+
+MachineHealth = 0.40*vibScore + 0.20*tempScore + 0.20*elecScore + 0.10*rpmScore + 0.10*corrScore;
+
+
+    % Print detailed sub-scores and final health
+    fprintf('\n=========== MACHINE HEALTH ===========\n');
+    fprintf('Vibration Score     : %.2f\n', vibScore);
+    fprintf('Temperature Score   : %.2f\n', tempScore);
+    fprintf('Electrical Score    : %.2f\n', elecScore);
+    fprintf('RPM Score           : %.2f\n', rpmScore);
+    fprintf('Correlation Score   : %.2f\n', corrScore);
+    fprintf('--------------------------------------\n');
+    fprintf('Machine Health (%)  : %.2f %%\n', MachineHealth);
+    fprintf('=======================================\n');
+
+    %% 10) HEARTBEAT TREND (plot)
+    healthHistory = [healthHistory; MachineHealth];
+    if length(healthHistory) > 2000
+        healthHistory = healthHistory(end-2000+1:end);
+    end
+
+    if ishandle(figHeart)
+        figure(figHeart);
+        plot(healthHistory, 'LineWidth', 2);
+        title('MACHINE HEALTH HEARTBEAT');
+        xlabel('Sample'); ylabel('Health (%)');
+        ylim([0 100]); grid on;
+        drawnow limitrate;
+    end
+
+    %% 11) Compact console report for quick reading
+    if isnan(T_now)
+        Tstr = 'NaN';
+    else
+        Tstr = sprintf('%.2f', T_now);
+    end
+    fprintf('Time: %s | Health: %.2f | VibRMS: %.3f | Temp: %s | Vrms: %.2f V | Irms: %.3f A\n', ...
+        datestr(now,'HH:MM:SS'), MachineHealth, vibRMS_now, Tstr, Vrms_now, Irms_now);
+
+%% ========================= CSV LOGGING & RENDER UPLOAD =========================
+
+csvFile = 'machine_data_log.csv';
+timestamp = datestr(now, 'yyyy-mm-dd HH:MM:SS');
+
+%% --- Temperature values ---
+if length(tempHistory) >= 2
+    TempPrev = tempHistory(end-1);
+else
+    TempPrev = NaN;
 end
 
-elecScore=max(0,100-abs(Power)/10);
-rpmScore=max(0,100-abs(corrPV)*40);
+TempDiff = T_now - TempPrev;
+TempRise60 = rise_60s;   % from your temp logic
 
-MachineHealth=0.4*vibScore+0.2*tempScore+0.2*elecScore+0.2*rpmScore;
+%% --- Electrical values ---
+VrmsVal = Vrms_now;
+IrmsVal = Irms_now;
 
-healthHistory=[healthHistory;MachineHealth];
+%% --- Vibration values ---
+RMSVal  = vibRMS_now;
+PeakVal = max([pksX(:); pksY(:); pksZ(:); 0]);   % safe peak extraction
 
-%% ---------------- HEARTBEAT ----------------
-figure(figHeart)
-plot(healthHistory,'LineWidth',2)
-ylim([0 100])
-ylabel('Health %')
-grid on
-drawnow
-
-%% ---------------- PRINT ----------------
-fprintf('\n===== MACHINE HEALTH REPORT =====\n');
-fprintf('Vibration RMS : %.3f\n',vibRMS);
-fprintf('Temperature   : %.2f C\n',T_now);
-fprintf('RPM           : %.2f\n',RPM_now);
-fprintf('Power         : %.2f\n',Power);
-fprintf('Health Score  : %.2f %%\n',MachineHealth);
-fprintf('=================================\n');
-
-pause(1);
-
+%% --- Determine health status ---
+if isnan(T_now)
+    StatusStr = "UNKNOWN";
+elseif T_now > 65
+    StatusStr = "FAULTY";
+elseif T_now > 55 || TempRise60 > 5
+    StatusStr = "WARNING";
+else
+    StatusStr = "HEALTHY";
 end
+
+%% --- Collect DTCs ---
+DTCs = [];
+
+if exist('imbalance_flag','var') && imbalance_flag
+    DTCs = [DTCs, "IMB.1"];
+end
+if exist('harmonic_imbalance_flag','var') && harmonic_imbalance_flag
+    DTCs = [DTCs, "IMB.H"];
+end
+if exist('misalignment_flag','var') && misalignment_flag
+    DTCs = [DTCs, "MIS.1"];
+end
+if exist('looseness_flag','var') && looseness_flag
+    DTCs = [DTCs, "LOOS.1"];
+end
+if exist('bearing_fault_flag','var') && bearing_fault_flag
+    DTCs = [DTCs, "BRF.1"];
+end
+if exist('temperature_fault_flag','var') && temperature_fault_flag
+    DTCs = [DTCs, "TEMP.1"];
+end
+
+if isempty(DTCs)
+    DTC_string = "NONE";
+else
+    DTC_string = strjoin(DTCs,";");
+end
+
+%% ========== CREATE TABLE (this table is the single correct definition) ==========
+Tsend = table( ...
+    string(timestamp), ...      % Timestamp
+    T_now, ...                  % TempC
+    TempPrev, ...               % Previous temperature
+    TempDiff, ...               % Temperature difference
+    TempRise60, ...             % Temp rise last 60s
+    VrmsVal, ...                % Voltage RMS
+    IrmsVal, ...                % Current RMS
+    RMSVal, ...                 % Vibration RMS
+    PeakVal, ...                % Peak Vib
+    MachineHealth, ...          % Health %
+    string(StatusStr), ...      % Status
+    vibScore, ...               % Vibration Score
+    tempScore, ...              % Temperature Score
+    elecScore, ...              % Electrical Score
+    rpmScore, ...               % RPM Score
+    corrScore, ...              % Correlation Score
+    string(DTC_string), ...     % DTC list
+    'VariableNames', { ...
+    'Timestamp', 'TempC', 'TempPrev', 'TempDiff', 'TempRise60', ...
+    'Vrms', 'Irms', 'RMS', 'Peak', 'HealthIndex', 'Status', ...
+    'vibScore', 'tempScore', 'elecScore', 'rpmScore', 'corrScore', 'DTCs'} ...
+);
+
+%% ========== WRITE TO LOCAL CSV ==========
+if ~isfile(csvFile)
+    % Create with header
+    writetable(Tsend, csvFile, 'WriteMode','overwrite');
+else
+    % Append WITHOUT header
+    writetable(Tsend, csvFile, 'WriteVariableNames', false, 'WriteMode','append');
+end
+
+%% ========== SEND CSV TO RENDER (raw text, like previous project) ==========
+try
+    % Convert table to CSV text manually
+    csvText = sprintf("Timestamp,TempC,TempPrev,TempDiff,TempRise60s,Vrms,Irms,RMS,Peak,HealthIndex,Status,vibScore,tempScore,elecScore,rpmScore,corrScore,DTCs\n");
+    csvText = [csvText, ...
+        sprintf("%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.2f,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%s\n", ...
+        Tsend.Timestamp, Tsend.TempC, Tsend.TempPrev, Tsend.TempDiff, Tsend.TempRise60, ...
+        Tsend.Vrms, Tsend.Irms, Tsend.RMS, Tsend.Peak, Tsend.HealthIndex, Tsend.Status, ...
+        Tsend.vibScore, Tsend.tempScore, Tsend.elecScore, Tsend.rpmScore, Tsend.corrScore, Tsend.DTCs)];
+
+    % Upload
+  opts = weboptions("Timeout", 20, "MediaType","text/plain","RequestMethod","post");
+
+webwrite(uploadURL, csvText, opts);
+
+    disp("Render Upload Success");
+catch ME
+    fprintf("Render Upload Error: %s\n", ME.message);
+end
+
+
+drawnow;    % ensure all figures update
+pause(0.01); 
+    pause(1); % 1-second loop
+end % while
+
+end % function firebase_live_plot
+
+%% =================================================================
+% RPM helper subfunction
+%% =================================================================
+function [RPM_now,stdRPM,dRPM,status] = analyzeRPM(rpmArray,t)
+    RPM_now = rpmArray(end);
+    stdRPM = std(rpmArray);
+  if length(rpmArray) >= 2
+    dRPM = rpmArray(end) - rpmArray(1);
+else
+    dRPM = 0;
+end
+
+    if stdRPM > 50 || abs(dRPM) > 100
+        status = "UNSTABLE";
+    else
+        status = "STABLE";
+    end
 end
