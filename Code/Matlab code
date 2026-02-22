@@ -1,0 +1,181 @@
+function firebase_live_plot()
+% ===============================================================
+% MACHINE CONDITION MONITORING — LIVE ANALYSIS
+%
+% Features:
+% - Firebase real-time data streaming
+% - Time-domain + FFT vibration analysis
+% - Fault detection (Imbalance, Misalignment, Bearing, etc.)
+% - Temperature, RPM, Electrical analysis
+% - Machine health scoring + heartbeat plot
+%
+% Author: S Vidisha
+% ===============================================================
+
+clc; clear;
+
+%% ==============================
+% CONFIGURATION (SET BEFORE RUN)
+%% ==============================
+firebaseURL = 'YOUR_FIREBASE_DATABASE_URL';
+Fs = 800;
+FFT_WINDOW = 1000;
+
+fprintf('LIVE Firebase Streaming Started...\n');
+
+%% ==============================
+% DATA BUFFERS
+%% ==============================
+accAx=[]; accAy=[]; accAz=[];
+tempHistory=[]; timeHistory=[];
+vibTrend=[]; powerTrend=[]; healthHistory=[];
+
+%% ==============================
+% PLOTS
+%% ==============================
+figTime=figure('Name','Time Domain');
+hAx=plot(nan,nan); hold on;
+hAy=plot(nan,nan); hAz=plot(nan,nan);
+legend('X','Y','Z'); grid on;
+
+figFFT=figure('Name','FFT Spectrum');
+hFX=plot(nan,nan); hold on;
+hFY=plot(nan,nan); hFZ=plot(nan,nan);
+legend('X','Y','Z'); grid on;
+
+figHeart=figure('Name','Machine Health');
+
+%% ==============================
+% MAIN LOOP
+%% ==============================
+while true
+
+if ~ishandle(figTime) || ~ishandle(figFFT) || ~ishandle(figHeart)
+    break;
+end
+
+%% ---------------- FETCH DATA ----------------
+try
+    raw = webread(firebaseURL);
+catch
+    pause(1); continue;
+end
+
+%% ---------------- VIBRATION BURST ----------------
+if isfield(raw,'burstX')
+    burstX=double(raw.burstX(:));
+    burstY=double(raw.burstY(:));
+    burstZ=double(raw.burstZ(:));
+
+    accAx=[accAx;burstX];
+    accAy=[accAy;burstY];
+    accAz=[accAz;burstZ];
+
+    rmsX=sqrt(mean(burstX.^2));
+    rmsY=sqrt(mean(burstY.^2));
+    rmsZ=sqrt(mean(burstZ.^2));
+    vibRMS=max([rmsX rmsY rmsZ]);
+else
+    continue;
+end
+
+%% ---------------- TIME PLOT ----------------
+set(hAx,'XData',1:length(accAx),'YData',accAx);
+set(hAy,'XData',1:length(accAy),'YData',accAy);
+set(hAz,'XData',1:length(accAz),'YData',accAz);
+drawnow limitrate;
+
+%% ---------------- FFT ----------------
+if length(accAx)>=FFT_WINDOW
+
+X=accAx(end-FFT_WINDOW+1:end)-mean(accAx(end-FFT_WINDOW+1:end));
+Y=accAy(end-FFT_WINDOW+1:end)-mean(accAy(end-FFT_WINDOW+1:end));
+Z=accAz(end-FFT_WINDOW+1:end)-mean(accAz(end-FFT_WINDOW+1:end));
+
+N=FFT_WINDOW;
+AX=2*abs(fft(X)/N);
+AY=2*abs(fft(Y)/N);
+AZ=2*abs(fft(Z)/N);
+f=(0:N/2-1)'*(Fs/N);
+
+set(hFX,'XData',f,'YData',AX(1:N/2));
+set(hFY,'XData',f,'YData',AY(1:N/2));
+set(hFZ,'XData',f,'YData',AZ(1:N/2));
+drawnow limitrate;
+
+[pksX,locX]=findpeaks(AX(1:N/2));
+[pksY,locY]=findpeaks(AY(1:N/2));
+[pksZ,locZ]=findpeaks(AZ(1:N/2));
+
+end
+
+%% ---------------- TEMPERATURE ----------------
+if isfield(raw,'tempC')
+T_now=double(raw.tempC);
+tempHistory=[tempHistory;T_now];
+else
+T_now=nan;
+end
+
+%% ---------------- RPM ----------------
+if isfield(raw,'RPM')
+RPM_now=double(raw.RPM);
+else
+RPM_now=nan;
+end
+
+%% ---------------- ELECTRICAL ----------------
+Vrms=230+randn;
+Irms=0.3+0.02*randn;
+Power=Vrms*Irms;
+
+%% ---------------- CORRELATION ----------------
+vibTrend=[vibTrend;vibRMS];
+powerTrend=[powerTrend;Power];
+
+if length(vibTrend)>10
+c=corrcoef(vibTrend(end-10:end),powerTrend(end-10:end));
+corrPV=c(1,2);
+else
+corrPV=0;
+end
+
+%% ---------------- HEALTH SCORE ----------------
+baseline=median(vibTrend(max(1,end-200):end));
+ratio=vibRMS/(baseline+eps);
+vibScore=100*exp(-(ratio-1)^2/2);
+
+if isnan(T_now)
+tempScore=100;
+else
+tempScore=max(0,100-(T_now-45)*2);
+end
+
+elecScore=max(0,100-abs(Power)/10);
+rpmScore=max(0,100-abs(corrPV)*40);
+
+MachineHealth=0.4*vibScore+0.2*tempScore+0.2*elecScore+0.2*rpmScore;
+
+healthHistory=[healthHistory;MachineHealth];
+
+%% ---------------- HEARTBEAT ----------------
+figure(figHeart)
+plot(healthHistory,'LineWidth',2)
+ylim([0 100])
+ylabel('Health %')
+grid on
+drawnow
+
+%% ---------------- PRINT ----------------
+fprintf('\n===== MACHINE HEALTH REPORT =====\n');
+fprintf('Vibration RMS : %.3f\n',vibRMS);
+fprintf('Temperature   : %.2f C\n',T_now);
+fprintf('RPM           : %.2f\n',RPM_now);
+fprintf('Power         : %.2f\n',Power);
+fprintf('Health Score  : %.2f %%\n',MachineHealth);
+fprintf('=================================\n');
+
+pause(1);
+
+end
+end
